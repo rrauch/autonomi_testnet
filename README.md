@@ -34,11 +34,11 @@ The image requires a few environment variables to be set and works best with hos
 
 **Mandatory Environment Variable:**
 
-*   `REWARDS_ADDRESS`: An Ethereum address that will receive storage rewards on the testnet. This can be any valid Ethereum address (e.g., `0x728Ce96E4833481eE2d66D5f47B50759EF608c5E`).
+*   `HOST_IP_ADDRESS`: **Crucially**, set this to the IP address of your Docker host machine. This allows clients running *outside* the container to connect to the network.
 
-**Recommended Environment Variable:**
+**Optional Environment Variable:**
 
-*   `ANVIL_IP_ADDR`: **Crucially**, set this to the IP address of your Docker host machine. This allows clients running *outside* the container to connect to the Anvil EVM instance.
+*   `REWARDS_ADDRESS`: An Ethereum address that will receive storage rewards on the testnet. This can be any valid Ethereum address; defaults to `0x728Ce96E4833481eE2d66D5f47B50759EF608c5E`.
 
 **Recommended Docker Flag:**
 
@@ -50,8 +50,7 @@ The image requires a few environment variables to be set and works best with hos
 docker run \
   --rm \
   --network host \
-  -e REWARDS_ADDRESS="0x728Ce96E4833481eE2d66D5f47B50759EF608c5E" \
-  -e ANVIL_IP_ADDR="YOUR_HOST_IP_ADDRESS" \
+  -e HOST_IP_ADDRESS="YOUR_HOST_IP_ADDRESS" \
   ghcr.io/rrauch/autonomi_testnet:latest
 ```
 
@@ -79,6 +78,15 @@ node details
 53875   12D3KooW...
 
 ------------------------------------------------------
+
+Bootstrap URL: http://YOUR_HOST_IP_ADDRESS:38112/bootstrap.txt
+
+------------------------------------------------------
+
+autonomi:config:local?rpc_url=http%3A%2F%2FYOUR_HOST_IP_ADDRESS%3A14143%2F&payment_token_addr=0x...&data_payments_addr=0x...&bootstrap_url=http%3A%2F%2F2FYOUR_HOST_IP_ADDRESS%3A38112%2Fbootstrap.txt
+
+------------------------------------------------------
+
 ```
 
 *   **EVM Details:** This section provides connection details for the local EVM used for payment processing. Note that `RPC_URL` will use the `ANVIL_IP_ADDR` you provided.
