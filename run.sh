@@ -1,307 +1,484 @@
 #!/bin/bash
-echo "Now running as user $(whoami) (UID $(id -u): GID $(id -g))"
+#
+# Purpose: Initializes a local Autonomi testnet environment.
+#   1. Validates required environment variables and system IP.
+#   2. Cleans up previous run artifacts.
+#   3. Starts the 'evm-testnet' process.
+#   4. Waits for and parses configuration data from evm-testnet.
+#   5. Starts multiple 'antnode' processes based on NODE_PORT range.
+#   6. Waits for nodes to register in the bootstrap cache.
+#   7. Serves bootstrap information via a simple HTTP server.
+#   8. Prints connection details.
+#   9. Monitors running 'antnode' processes and exits if any crash.
+#
+# Environment Variables:
+#   - REWARDS_ADDRESS: Required rewards address.
+#   - EXTERNAL_IP_ADDRESS: Required external IP for nodes.
+#   - NODE_PORT: Required port or port range (e.g., 9000 or 9000-9002).
+#   - BOOTSTRAP_PORT: Required port for the bootstrap HTTP server.
+#
 
-# 1. Check if required environment variables is set
-echo "Checking for REWARDS_ADDRESS..."
-if [ -z "$REWARDS_ADDRESS" ]; then
-  echo "Error: REWARDS_ADDRESS environment variable is not set. Cannot proceed."
-  exit 1 # Exit with a non-zero status to indicate failure
-fi
-echo "REWARDS_ADDRESS is set: $REWARDS_ADDRESS"
+# --- Strict Mode & Error Handling ---
+# set -e: Exit immediately if a command exits with a non-zero status.
+# set -u: Treat unset variables as an error when substituting.
+# set -o pipefail: The return value of a pipeline is the status of the last command
+#                  to exit with a non-zero status, or zero if no command exited
+#                  with a non-zero status.
+set -euo pipefail
 
-echo "Checking for EXTERNAL_IP_ADDRESS..."
-if [ -z "$EXTERNAL_IP_ADDRESS" ]; then
-  echo "Error: EXTERNAL_IP_ADDRESS environment variable is not set. Cannot proceed."
-  exit 1 # Exit with a non-zero status to indicate failure
-fi
-echo "EXTERNAL_IP_ADDRESS is set: $EXTERNAL_IP_ADDRESS"
+# --- Configuration & Constants ---
+# Using readonly ensures these aren't accidentally changed later.
 
-echo "Checking if IP address '$EXTERNAL_IP_ADDRESS' is configured on this system..."
+# Data directory (Consider making this configurable via ENV var too)
+readonly DATA_DIR="/data/.local/share/autonomi"
+readonly EXPORT_DIR="$DATA_DIR/export"
 
-found=false
-for ip_address in $(hostname -I); do
-  if [[ "$ip_address" == "$EXTERNAL_IP_ADDRESS" ]]; then
-    found=true
-    break # Found it, no need to check further
-  fi
-done
+# File paths
+readonly CSV_FILE="$DATA_DIR/evm_testnet_data.csv"
+readonly BOOTSTRAP_CACHE="$DATA_DIR/bootstrap_cache/bootstrap_cache_local_1_1.0.json"
+readonly BOOTSTRAP_TXT="$EXPORT_DIR/bootstrap.txt"
+readonly REGISTRY_FILE="$DATA_DIR/local_node_registry.json"
+readonly NODE_DIR="$DATA_DIR/node" # Directory for individual node data (if antnode uses it)
 
-if [[ "$found" == true ]]; then
-  echo "✅ Found: IP address '$EXTERNAL_IP_ADDRESS' is active on this system."
-  echo ""
-else
-  echo "❌ Not Found: IP address '$EXTERNAL_IP_ADDRESS' is not active on this system."
-  echo "   Active IPs reported by hostname -I:"
-  echo "   $(hostname -I)"
-  echo ""
-  echo "Cannot continue, aborting"
-  exit 1
-fi
+# Timeouts and Intervals (seconds)
+readonly FILE_WAIT_TIMEOUT_SEC=30
+readonly FILE_WAIT_INTERVAL_SEC=0.2 # Use floating point for sleep
+readonly NODE_WAIT_TIMEOUT_SEC=60   # Timeout for nodes appearing in bootstrap cache
+readonly NODE_WAIT_INTERVAL_SEC=0.2
+readonly MONITOR_INTERVAL_SEC=5
 
-export ANVIL_IP_ADDR="$EXTERNAL_IP_ADDRESS"
+# --- Global Variables ---
+# These will be populated by functions or loops
+declare EVM_PID=""
+declare -a ANTNODE_PIDS=() # Array to store antnode PIDs
+declare HTTPD_PID=""
+declare RPC_URL=""
+declare PAYMENT_TOKEN_ADDRESS=""
+declare DATA_PAYMENTS_ADDRESS=""
+declare SECRET_KEY=""
+declare -i NODES_STARTED=0 # Explicitly integer
 
-cleanup() {
-    exit 0
+# --- Utility Functions ---
+
+# Consistent error logging
+err() {
+    echo "ERROR: $*" >&2
 }
 
+# Consistent info logging
+log() {
+    echo "$*"
+}
+
+# --- Core Functions ---
+
+# Gracefully shut down background processes on exit/interrupt
+cleanup() {
+    log "Received signal, initiating cleanup..."
+    # Use kill 0 to check if process exists before attempting to kill
+    if [[ -n "$EVM_PID" ]] && kill -0 "$EVM_PID" &>/dev/null; then
+        log "Stopping evm-testnet (PID: $EVM_PID)..."
+        kill "$EVM_PID" || log "evm-testnet (PID: $EVM_PID) already stopped."
+    fi
+    if [[ ${#ANTNODE_PIDS[@]} -gt 0 ]]; then
+        log "Stopping antnode processes (PIDs: ${ANTNODE_PIDS[*]})..."
+        # Kill processes individually; allows better error handling if needed
+        for pid in "${ANTNODE_PIDS[@]}"; do
+             if kill -0 "$pid" &>/dev/null; then
+                 kill "$pid" || log "antnode (PID: $pid) already stopped."
+             fi
+        done
+    fi
+    if [[ -n "$HTTPD_PID" ]] && kill -0 "$HTTPD_PID" &>/dev/null; then
+        log "Stopping darkhttpd (PID: $HTTPD_PID)..."
+        kill "$HTTPD_PID" || log "darkhttpd (PID: $HTTPD_PID) already stopped."
+    fi
+    log "Cleanup complete."
+    # Exit with a non-zero status if script was interrupted
+    # 130 for SIGINT (Ctrl+C), 143 for SIGTERM
+    # This requires a more complex trap setup; for simplicity, just exit 1 on signal
+    exit 1
+}
+
+# Set trap early to catch signals during setup
 trap cleanup SIGTERM SIGINT
 
-DATA_DIR="/data/.local/share/autonomi"
-CSV_FILE="$DATA_DIR/evm_testnet_data.csv"
-rm -f "$CSV_FILE"
-rm -rf "$DATA_DIR/bootstrap_cache"
+# Check required environment variables are set
+validate_env_vars() {
+    log "Validating environment variables..."
+    local missing=0
+    for var in REWARDS_ADDRESS EXTERNAL_IP_ADDRESS NODE_PORT BOOTSTRAP_PORT; do
+        if [[ -z "${!var-}" ]]; then # Use indirect expansion + default val check
+            err "Required environment variable '$var' is not set."
+            missing=1
+        else
+             log "$var is set: ${!var}"
+        fi
+    done
+    [[ "$missing" -eq 0 ]] || { err "Cannot proceed due to missing variables."; exit 1; }
 
-BOOTSTRAP_CACHE="$DATA_DIR/bootstrap_cache/bootstrap_cache_local_1_1.0.json"
-
-EXPORT_DIR="$DATA_DIR/export"
-rm -rf "$EXPORT_DIR"
-mkdir -p "$EXPORT_DIR"
-BOOTSTRAP_TXT="$EXPORT_DIR/bootstrap.txt"
-
-REGISTRY_FILE="$DATA_DIR/local_node_registry.json"
-rm -f "$REGISTRY_FILE"
-
-NODE_DIR="$DATA_DIR/node"
-rm -rf "$NODE_DIR"
-
-# 2. Start 'evm-testnet' process in the background
-echo "Starting evm-testnet in the background..."
-# Assuming 'evm-testnet' is in the PATH, otherwise provide the full path
-evm-testnet &
-EVM_PID=$! # Capture the Process ID of the background job
-
-echo "evm-testnet started with PID $EVM_PID"
-
-# 3. Wait for a evm-testnet csv file to exist
-WAIT_TIMEOUT_SEC=30    # Maximum time to wait in seconds
-WAIT_INTERVAL_MSEC=200 # How often to check (in milliseconds)
-
-# Convert timeout to milliseconds for integer arithmetic
-WAIT_TIMEOUT_MSEC=$((WAIT_TIMEOUT_SEC * 1000))
-ELAPSED_TIME_MSEC=0
-
-echo "Waiting for file '$CSV_FILE' to appear (timeout: ${WAIT_TIMEOUT_SEC}s)..."
-
-# Calculate sleep duration in seconds for the 'sleep' command
-# Use bc for floating point division if needed, or pre-calculate if interval is simple
-# For 200ms, this is just 0.2 seconds
-SLEEP_DURATION_SEC="0.${WAIT_INTERVAL_MSEC}" # Simple string for sleep command if interval is < 1 sec
-
-while [ ! -f "$CSV_FILE" ] && [ "$ELAPSED_TIME_MSEC" -lt "$WAIT_TIMEOUT_MSEC" ]; do
-  echo "File not found yet. Waiting ${SLEEP_DURATION_SEC}s..."
-  # Use the sleep command which handles fractional seconds
-  sleep "$SLEEP_DURATION_SEC"
-  ELAPSED_TIME_MSEC=$((ELAPSED_TIME_MSEC + WAIT_INTERVAL_MSEC))
-done
-
-# Check if the file was found or if we timed out
-if [ ! -f "$CSV_FILE" ]; then
-  echo "Error: Timeout waiting for file '$CSV_FILE'. Aborting startup."
-  exit 1 # Exit with failure status
-fi
-
-echo "File '$CSV_FILE' found! Proceeding..."
-
-parse_csv_file() {
-  local file="$1"
-  
-  # Check if file exists
-  if [ ! -f "$file" ]; then
-    echo ">>> Error: File $file does not exist." >&2
-    return 1
-  fi
-  
-  # Read the first line of the file
-  local line
-  line=$(head -n 1 "$file")
-  
-  # Split the line by comma into an array
-  IFS=',' read -r -a parts <<< "$line"
-  
-  # Check if we have exactly 4 parts
-  if [ ${#parts[@]} -ne 4 ]; then
-    echo ">>> Error: Expected 4 comma-separated values in $file, found ${#parts[@]}." >&2
-    return 1
-  fi
-  
-  # Return values by setting variables in the parent scope
-  # Bash doesn't have a direct way to return multiple values,
-  # but we can set variables in the calling scope
-  RPC_URL="${parts[0]}"
-  PAYMENT_TOKEN_ADDRESS="${parts[1]}"
-  DATA_PAYMENTS_ADDRESS="${parts[2]}"
-  SECRET_KEY="${parts[3]}"
-  
-  # Return success
-  return 0
+    # Validate NODE_PORT format (simple check for number or number-number)
+    if ! [[ "$NODE_PORT" =~ ^[0-9]+(-[0-9]+)?$ ]]; then
+        err "Invalid NODE_PORT format: '$NODE_PORT'. Expected format: 'PORT' or 'START_PORT-END_PORT'."
+        exit 1
+    fi
+    log "Environment variables validated."
 }
 
-parse_csv_file "$CSV_FILE"
-
-
-echo ">>> Starting nodes for ports [$NODE_PORT] ..."
-
-start_port=${NODE_PORT%-*}
-end_port=${NODE_PORT#*-}
-
-nodes_started=0
-
-for (( port = start_port; port <= end_port; port++ )); do
-  ((nodes_started++))
-
-  echo "--- Starting Node ${nodes_started} on Port ${port} ---"
-
-  cmd_args=(
-    "antnode"
-    "--rewards-address" "$REWARDS_ADDRESS"
-    "--ip" "$EXTERNAL_IP_ADDRESS"
-    "--local"
-    "--port" "$port"
-  )
-
-  sleep_duration="0.200"
-
-  if (( nodes_started == 1 )); then
-    cmd_args+=("--first")
-    sleep_duration="1"
-  fi
-
-  cmd_args+=(
-    "evm-custom"
-    "--rpc-url" "$RPC_URL"
-    "--payment-token-address" "$PAYMENT_TOKEN_ADDRESS"
-    "--data-payments-address" "$DATA_PAYMENTS_ADDRESS"
-  )
-
-  "${cmd_args[@]}" &
-
-  sleep "$sleep_duration"
-done
-
-sleep 1
-
-if [[ ! -f "$BOOTSTRAP_CACHE" ]]; then
-  echo "Error: Bootstrap cache file not found: $BOOTSTRAP_CACHE" >&2
-  exit 1
-fi
-
-nodes_running=0
-start_time=$SECONDS
-declare -a NODES
-
-while true; do 
-  NODES=()
-  mapfile -t NODES < <(jq -r '.peers[][].addr' "$BOOTSTRAP_CACHE")
-  nodes_running=${#NODES[@]}
-  current_time=$SECONDS
-  elapsed_time=$((current_time - start_time))
-  
-  if (( nodes_running >= nodes_started )); then
-    break
-  fi
-  
-  if (( elapsed_time >= timeout_duration )); then
-    echo "Error: Node startup timeout exceeded, aborting" >&2
-    exit 1
-  fi
-  
-  sleep "0.200"
-done
-
-printf "%s\n" "${NODES[@]}" > "$BOOTSTRAP_TXT"
-
-echo ""	
-echo "------------------------------------------------------"
-echo "evm testnet details"
-echo ""
-echo "> RPC_URL: $RPC_URL"
-echo "> PAYMENT_TOKEN_ADDRESS: $PAYMENT_TOKEN_ADDRESS"
-echo "> DATA_PAYMENTS_ADDRESS: $DATA_PAYMENTS_ADDRESS"
-echo "> SECRET_KEY: $SECRET_KEY"
-echo ""
-echo "------------------------------------------------------"
-echo ""
-echo "node details"
-echo ""
-
-printf "%s\n" "${NODES[@]}"
-
-echo ""
-echo "------------------------------------------------------"
-echo ""
-
-
-darkhttpd "$EXPORT_DIR" --port "$BOOTSTRAP_PORT" --daemon --no-listing > /dev/null 2>&1
-
-BOOTSTRAP_URL="http://$EXTERNAL_IP_ADDRESS:$BOOTSTRAP_PORT/bootstrap.txt"
-echo "Bootstrap URL: $BOOTSTRAP_URL"
-
-echo ""
-echo "------------------------------------------------------"
-echo ""
-
-
-# Function to URL encode a string according to RFC 3986
-urlencode() {
-    # Check if argument is provided
-    if [ -z "$1" ]; then
-        echo "Error: No input provided to urlencode" >&2
-        return 1
+# Check if the provided external IP is configured on the system
+validate_ip_address() {
+    log "Checking if IP address '$EXTERNAL_IP_ADDRESS' is configured..."
+    
+    # Get all non-loopback IPs reported by hostname -I
+    local all_configured_ips
+    read -r -a all_configured_ips <<< "$(hostname -I)"
+    
+    # Check if the array is empty (hostname -I might return nothing)
+    if [[ ${#all_configured_ips[@]} -eq 0 ]]; then
+        err "❌ Not Found: hostname -I returned no IP addresses."
+        err "Cannot continue, aborting."
+        exit 1
     fi
-    
-    local string="$1"
-    local length="${#string}"
-    local i=0
-    local encoded=""
-    local c
-    
-    while [ "$i" -lt "$length" ]; do
-        c="${string:$i:1}"
-        case "$c" in
-            [a-zA-Z0-9.~_-]) 
-                # These are the "unreserved" characters that don't need encoding
-                encoded+="$c"
-                ;;
-            *)
-                # All other characters need percent-encoding
-                # Using printf to get the ASCII value and convert to hex
-                LC_CTYPE=C printf -v encoded_char '%%%02X' "'$c"
-                encoded+="$encoded_char"
-                ;;
-        esac
-        i=$((i + 1))
+       
+    local found_ip=false
+  
+    for ip in "${all_configured_ips[@]}"; do
+        if [[ "$ip" == "$EXTERNAL_IP_ADDRESS" ]]; then
+            found_ip=true
+            break
+        fi
     done
     
+    if "$found_ip"; then
+        log "✅ Found: IP address '$EXTERNAL_IP_ADDRESS' is active on this system."
+    else
+        err "❌ Not Found: IP address '$EXTERNAL_IP_ADDRESS' is not active on this system."
+        log "   Active non-loopback IPs found (via hostname -I):"
+        printf "   %s\n" "${all_configured_ips[@]}"
+        err "Cannot continue, aborting."
+        exit 1
+    fi
+    export ANVIL_IP_ADDR="$EXTERNAL_IP_ADDRESS"
+}
+
+# Prepare directories, removing old artifacts
+prepare_directories() {
+    log "Preparing data directories in $DATA_DIR..."
+    rm -f "$CSV_FILE" "$REGISTRY_FILE"
+    rm -rf "$DATA_DIR/bootstrap_cache" "$EXPORT_DIR" "$NODE_DIR"
+    mkdir -p "$EXPORT_DIR"
+    log "Directories prepared."
+}
+
+# Wait for a specific file to appear
+wait_for_file() {
+    local file_path="$1"
+    local timeout="$2"
+    local interval="$3"
+    log "Waiting up to ${timeout}s for file '$file_path'..."
+
+    local elapsed=0
+    local start_time
+    start_time=$(date +%s)
+
+    while [[ ! -f "$file_path" ]]; do
+        local current_time
+        current_time=$(date +%s)
+        elapsed=$((current_time - start_time))
+
+        if (( elapsed >= timeout )); then
+            err "Timeout waiting for file '$file_path'. Aborting startup."
+            exit 1
+        fi
+        # Use sleep with floating point seconds
+        sleep "$interval"
+        # Optional: Add a small log message inside loop if needed for debugging hangs
+        # log "Still waiting for $file_path..."
+    done
+
+    log "File '$file_path' found!"
+}
+
+# Parse the CSV file (adapted from original, ensuring vars are global)
+parse_csv_file() {
+    local file="$1"
+    log "Parsing CSV file '$file'..."
+
+    # File existence already checked by wait_for_file, but double-check is cheap
+    if [[ ! -f "$file" ]]; then
+        err "File '$file' disappeared after check?"
+        return 1 # Let set -e handle exit
+    fi
+
+    # Read the first line
+    local line
+    line=$(head -n 1 "$file")
+
+    # Split the line by comma into an array
+    local -a parts
+    IFS=',' read -r -a parts <<< "$line"
+
+    # Check if we have exactly 4 parts
+    if [[ ${#parts[@]} -ne 4 ]]; then
+        err "Expected 4 comma-separated values in '$file', found ${#parts[@]}."
+        return 1
+    fi
+
+    # Assign to global variables (ensure they are declared outside)
+    RPC_URL="${parts[0]}"
+    PAYMENT_TOKEN_ADDRESS="${parts[1]}"
+    DATA_PAYMENTS_ADDRESS="${parts[2]}"
+    SECRET_KEY="${parts[3]}" # Be careful logging/using secret keys
+
+    log "CSV parsed successfully."
+    # No explicit return 0 needed with set -e
+}
+
+# Start antnode instances based on NODE_PORT range
+start_nodes() {
+    log "Starting antnodes for ports [$NODE_PORT]..."
+
+    local start_port end_port
+    if [[ "$NODE_PORT" == *-* ]]; then
+        start_port=${NODE_PORT%-*}
+        end_port=${NODE_PORT#*-}
+    else
+        start_port=$NODE_PORT
+        end_port=$NODE_PORT
+    fi
+
+    NODES_STARTED=0 # Reset counter
+    ANTNODE_PIDS=()   # Reset PID array
+
+    for (( port = start_port; port <= end_port; port++ )); do      
+        ((++NODES_STARTED))
+        log "--- Starting Node ${NODES_STARTED} on Port ${port} ---"
+        # Build command arguments using an array for safety
+        local -a cmd_args=(
+            "antnode"
+            "--rewards-address" "$REWARDS_ADDRESS"
+            "--ip" "$EXTERNAL_IP_ADDRESS"
+            "--local"
+            "--port" "$port"
+        )
+
+        local sleep_duration="0.2" # Default short delay between starts
+
+        # Special handling for the first node
+        if (( NODES_STARTED == 1 )); then
+            cmd_args+=("--first")
+            sleep_duration="1.0" # Longer delay after starting the first node
+        fi
+
+        # Add EVM custom parameters
+        cmd_args+=(
+            "evm-custom"
+            "--rpc-url" "$RPC_URL"
+            "--payment-token-address" "$PAYMENT_TOKEN_ADDRESS"
+            "--data-payments-address" "$DATA_PAYMENTS_ADDRESS"
+        )
+
+        # Execute in background and capture PID
+        log "Executing: ${cmd_args[*]}" # Log the command for debugging
+        "${cmd_args[@]}" &
+        ANTNODE_PIDS+=($!) # Store the PID
+        log "Node ${NODES_STARTED} started with PID ${ANTNODE_PIDS[-1]} on port ${port}."
+
+        log "Sleeping for ${sleep_duration}s..."
+        sleep "$sleep_duration"
+    done
+
+    if [[ ${#ANTNODE_PIDS[@]} -ne $NODES_STARTED ]]; then
+         err "Mismatch between nodes started ($NODES_STARTED) and PIDs captured (${#ANTNODE_PIDS[@]})."
+         exit 1
+    fi
+    log "All $NODES_STARTED antnode processes initiated."
+}
+
+# Wait for nodes to appear in the bootstrap cache file
+wait_for_nodes() {
+    log "Waiting up to ${NODE_WAIT_TIMEOUT_SEC}s for $NODES_STARTED nodes to register in '$BOOTSTRAP_CACHE'..."
+
+    if [[ ! -f "$BOOTSTRAP_CACHE" ]]; then
+      # It might take a moment for the *first* node to create the cache
+      log "Bootstrap cache '$BOOTSTRAP_CACHE' not present yet, waiting..."
+      # Add a brief initial wait specific for the cache file itself if needed
+      sleep 2
+      if [[ ! -f "$BOOTSTRAP_CACHE" ]]; then
+          err "Bootstrap cache file '$BOOTSTRAP_CACHE' did not appear."
+          exit 1
+      fi
+    fi
+
+    local start_time nodes_running elapsed
+    start_time=$(date +%s)
+    declare -a discovered_nodes=()
+
+    while true; do
+        # Use || true with jq in case the file is empty or malformed temporarily
+        mapfile -t discovered_nodes < <(jq -r '.peers[][].addr' "$BOOTSTRAP_CACHE" || true)
+        nodes_running=${#discovered_nodes[@]}
+
+        log "Found $nodes_running / $NODES_STARTED nodes registered in cache..."
+
+        if (( nodes_running >= NODES_STARTED )); then
+            log "All $NODES_STARTED nodes registered."
+            # Write the discovered nodes to the bootstrap file
+            printf "%s\n" "${discovered_nodes[@]}" > "$BOOTSTRAP_TXT"
+            log "Bootstrap node list written to '$BOOTSTRAP_TXT'."
+            break # Success!
+        fi
+
+        local current_time
+        current_time=$(date +%s)
+        elapsed=$((current_time - start_time))
+
+        if (( elapsed >= NODE_WAIT_TIMEOUT_SEC )); then
+            err "Timeout waiting for nodes to register in '$BOOTSTRAP_CACHE'. Found $nodes_running / $NODES_STARTED."
+            printf "%s\n" "${discovered_nodes[@]}" > "$BOOTSTRAP_TXT.partial" # Save partial list for debugging
+            log "Partial node list saved to '$BOOTSTRAP_TXT.partial'."
+            exit 1
+        fi
+
+        sleep "$NODE_WAIT_INTERVAL_SEC"
+    done
+}
+
+# Start the simple HTTP server for bootstrap info
+start_http_server() {
+    log "Starting darkhttpd on port $BOOTSTRAP_PORT to serve '$EXPORT_DIR'..."
+    # Ensure BOOTSTRAP_PORT is set (checked in validate_env_vars)
+    darkhttpd "$EXPORT_DIR" --port "$BOOTSTRAP_PORT" --no-listing &>/dev/null &
+    HTTPD_PID=$!
+    log "darkhttpd started with PID $HTTPD_PID."
+
+    # Check if it started successfully (optional, basic check)
+    sleep 0.5 # Give it a moment to potentially fail
+    if ! kill -0 "$HTTPD_PID" &>/dev/null; then
+        err "Failed to start darkhttpd."
+        HTTPD_PID="" # Clear PID as it's not valid
+        exit 1
+    fi
+}
+
+# URL encodes a string (RFC 3986)
+# Kept original logic, seems standard and correct. Added input check.
+urlencode() {
+    local string="$1" i=0 length encoded="" c encoded_char
+    length="${#string}"
+
+    if [[ -z "$string" ]]; then
+        # No error message needed if just returning empty for empty input
+        # err "No input provided to urlencode" # Uncomment if empty input is an error
+        echo ""
+        return 0 # Or return 1 if considered an error
+    fi
+
+    while (( i < length )); do
+        c="${string:$i:1}"
+        case "$c" in
+            [a-zA-Z0-9.~_-]) encoded+="$c" ;;
+            *) LC_CTYPE=C printf -v encoded_char '%%%02X' "'$c"
+               encoded+="$encoded_char" ;;
+        esac
+        ((++i))
+    done
     echo "$encoded"
 }
 
+# Monitor running antnode processes
+monitor_nodes() {
+    log "Monitoring $NODES_STARTED antnode processes..."
 
-echo "autonomi:config:local?rpc_url=$( urlencode "$RPC_URL" )&payment_token_addr=$PAYMENT_TOKEN_ADDRESS&data_payments_addr=$DATA_PAYMENTS_ADDRESS&bootstrap_url=$( urlencode "$BOOTSTRAP_URL" )"
+    while true; do
+        sleep "$MONITOR_INTERVAL_SEC"
+        local running_pids=0
+        # Check each expected PID
+        for pid in "${ANTNODE_PIDS[@]}"; do
+            if kill -0 "$pid" &>/dev/null; then
+                ((++running_pids))
+            else
+                log "Detected antnode process with expected PID $pid is no longer running."
+            fi
+        done
+
+        if (( running_pids < NODES_STARTED )); then
+            err "Process count mismatch! Expected $NODES_STARTED antnode processes, but only $running_pids seem active based on PIDs."
+            err "Node crash or unexpected termination assumed. Aborting."
+            # Cleanup will be triggered by trap on exit
+            exit 1
+        fi
+    done
+}
 
 
-echo ""
-echo "------------------------------------------------------"
-echo ""
+# --- Main Execution ---
 
+main() {
+    log "Starting Autonomi testnet setup script..."
+    log "Running as user $(whoami) (UID $(id -u): GID $(id -g))"
 
-# 5. Run 'status_check' command in a loop until it fails
-STATUS_CHECK_SLEEP_SECONDS=5 # How long to sleep between status_check executions
+    validate_env_vars
+    validate_ip_address
+    prepare_directories
 
-echo ">>> Nodes started, observing antnode processes"
+    # Start evm-testnet
+    log "Starting evm-testnet in the background..."
+    evm-testnet & # Assuming 'evm-testnet' is in PATH
+    EVM_PID=$!
+    log "evm-testnet started with PID $EVM_PID."
+    # Basic check if process started
+    sleep 0.5
+    if ! kill -0 "$EVM_PID" &>/dev/null; then
+        err "evm-testnet failed to start or exited immediately."
+        EVM_PID="" # Clear PID
+        exit 1
+    fi
 
-while true; do
-  # Sleep first
-  sleep "$STATUS_CHECK_SLEEP_SECONDS"
-  process_count=$(pgrep -cx antnode || true)
-  if (( process_count != nodes_running )); then
-  echo "Error: Process count mismatch!" >&2  
-  echo "  Expected $nodes_running 'antnode' processes, but found $process_count running." >&2
-  echo "  Node crash assumed, aborting" >&2
-  exit 1 
-  fi
-done
+    # Wait for and parse CSV
+    wait_for_file "$CSV_FILE" "$FILE_WAIT_TIMEOUT_SEC" "$FILE_WAIT_INTERVAL_SEC"
+    parse_csv_file "$CSV_FILE" # Errors handled by set -e or explicit exit
 
-# This part is only reached if the 'while true' loop is somehow broken without the command failing.
-echo ">>> Loop unexpectedly terminated." # Should not be reached
+    # Start antnodes
+    start_nodes # Errors handled inside
+
+    # Wait for nodes to register
+    wait_for_nodes # Errors handled inside
+
+    # Start bootstrap HTTP server
+    start_http_server # Errors handled inside
+
+    # --- Output Final Details ---
+    # Define URL *after* http server is confirmed running
+    local bootstrap_url="http://$EXTERNAL_IP_ADDRESS:$BOOTSTRAP_PORT/bootstrap.txt"
+
+    log "------------------------------------------------------"
+    log "EVM Testnet Details:"
+    log "  RPC_URL: $RPC_URL"
+    log "  PAYMENT_TOKEN_ADDRESS: $PAYMENT_TOKEN_ADDRESS"
+    log "  DATA_PAYMENTS_ADDRESS: $DATA_PAYMENTS_ADDRESS"    
+    log "  SECRET_KEY: $SECRET_KEY"
+    log "------------------------------------------------------"
+    log "Node Details (from $BOOTSTRAP_TXT):"
+    # Use paste to indent the output for clarity
+    paste -sd '\n' "$BOOTSTRAP_TXT" | sed 's/^/  /'
+    log "------------------------------------------------------"
+    log "Bootstrap URL: $bootstrap_url"
+    log "------------------------------------------------------"
+    log "Autonomi Config URI:"
+    # Note: Consider if the secret key should be part of this config string
+    local config_string="autonomi:config:local?rpc_url=$( urlencode "$RPC_URL" )&payment_token_addr=$PAYMENT_TOKEN_ADDRESS&data_payments_addr=$DATA_PAYMENTS_ADDRESS&bootstrap_url=$( urlencode "$bootstrap_url" )"
+    echo "$config_string" # Print config string to stdout directly
+    log "------------------------------------------------------"
+
+    # Monitor nodes indefinitely
+    monitor_nodes
+}
+
+# Execute the main function
+main
+
+# Final exit (should not be reached if monitor_nodes runs forever)
+log "Monitoring loop terminated unexpectedly."
 exit 1
 

@@ -2,7 +2,7 @@
 # The `builder` stage compiles the binary and gathers all dependencies in the `/export/` directory.
 FROM debian:12 AS builder
 RUN apt-get update && apt-get -y upgrade \
- && apt-get -y install wget curl build-essential gcc make libssl-dev pkg-config git jq procps
+ && apt-get -y install wget curl build-essential gcc make libssl-dev pkg-config git jq
 
 # Install darkhttpd from Git repo
 RUN cd /usr/local/src/ \
@@ -54,9 +54,9 @@ COPY init.sh /
 RUN chmod 0755 /init.sh
 
 # Use `depres` to identify all required files for the final image.
-RUN depres /bin/sh /bin/bash /bin/ls /usr/bin/su /usr/bin/chown /usr/bin/mv \
-    /usr/bin/cat /usr/bin/whoami /usr/bin/id /usr/bin/sleep /usr/bin/head /usr/bin/chmod \
-    /usr/bin/sed /usr/bin/rm /usr/bin/jq /usr/bin/mkdir /usr/bin/pgrep /usr/bin/hostname \
+RUN depres /bin/sh /bin/bash /bin/ls /usr/bin/su /usr/bin/chown /usr/bin/mv /usr/bin/paste \
+    /usr/bin/cat /usr/bin/whoami /usr/bin/id /usr/bin/sleep /usr/bin/chmod /usr/bin/date \
+    /usr/bin/sed /usr/bin/grep /usr/bin/rm /usr/bin/jq /usr/bin/mkdir /usr/bin/hostname /usr/bin/head  \
     /usr/local/sbin/gosu \
     /usr/local/bin/darkhttpd \
     /usr/local/bin/anvil \
@@ -100,6 +100,6 @@ EXPOSE 38112
 
 ENV REWARDS_ADDRESS=0x728Ce96E4833481eE2d66D5f47B50759EF608c5E
 
-ENV ANTNODE_VERSION=latest
+ENV ANTNODE_SOURCE=LATEST
 
 CMD /init.sh

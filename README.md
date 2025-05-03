@@ -30,19 +30,24 @@ docker build -t autonomi-local-testnet .
 
 ### Running the Testnet
 
-The image requires a few environment variables to be set and works best with host networking for easy client connectivity.
+Getting this testnet container running smoothly, especially connecting your clients to it, means thinking a bit about networking. The services inside the container (the Autonomi nodes, the EVM, the bootstrap server) need to be directly reachable by your client applications running *outside* the container, usually on the same local network.
 
-**Mandatory Environment Variable:**
+There's a check built into the container startup: the `EXTERNAL_IP_ADDRESS` you set *must* be an IP address that the container itself actually has access to on one of its network interfaces. This is a bit unusual for a container! It means typical setups where Docker gives the container a private, internal-only IP won't work properly and the container won't start. You need a network setup where the container gets an IP reachable from your clients. The easiest way to handle this is using `--network host`, which makes the container share your hosts's network address directly.
 
-*   `HOST_IP_ADDRESS`: **Crucially**, set this to the IP address of your Docker host machine. This allows clients running *outside* the container to connect to the network.
+You configure the container using environment variables. Here are the options:
 
-**Optional Environment Variable:**
-
-*   `REWARDS_ADDRESS`: An Ethereum address that will receive storage rewards on the testnet. This can be any valid Ethereum address; defaults to `0x728Ce96E4833481eE2d66D5f47B50759EF608c5E`.
+| Environment Variable    | Default Value                      | Function                                                                                                                                                              |
+| :---------------------- | :--------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `EXTERNAL_IP_ADDRESS`   | -                                  | **Crucial:** The IP address external clients should use to reach the container's services (nodes, EVM, bootstrap). **Mandatory**. Must be reachable by clients and present on a container network interface. |
+| `NODE_PORT`             | `53851-53875`                      | A range of UDP ports (START-END). The container starts one storage node for *each* port in this range. The number of nodes is determined by the length of the range. |
+| `ANVIL_PORT`            | 14143                              | The TCP port for the local EVM (Anvil) RPC server, used for payment transactions.                                                                                     |
+| `BOOTSTRAP_PORT`        | 38112                              | The TCP port for the simple HTTP server hosting the `bootstrap.txt` file, which clients can use to discover the nodes.                                          |
+| `REWARDS_ADDRESS`       | `0x728Ce96E4833481eE2d66D5f47B...` | An Ethereum address that will be configured in the nodes to receive rewards generated on the testnet.                                                                   |
+| `ANTNODE_SOURCE`        | `LATEST`                           | Controls which `antnode` binary is used. Set to `LATEST` to download the most recent version on startup, or any other value to use the version bundled within the Docker image. |
 
 **Recommended Docker Flag:**
 
-*   `--network host`: Using host networking simplifies port mapping and allows the nodes and EVM to be directly accessible on the host's network interfaces.
+*   `--network host`: As mentioned, using host networking is the simplest way to make the container's services accessible directly on your hosts's IP addresses, which works nicely with the `EXTERNAL_IP_ADDRESS` requirement.
 
 **Example Run Command:**
 
@@ -50,11 +55,11 @@ The image requires a few environment variables to be set and works best with hos
 docker run \
   --rm \
   --network host \
-  -e HOST_IP_ADDRESS="YOUR_HOST_IP_ADDRESS" \
+  -e EXTERNAL_IP_ADDRESS="YOUR_HOST_IP_ADDRESS" \
   ghcr.io/rrauch/autonomi_testnet:latest
 ```
 
-Replace `YOUR_HOST_IP_ADDRESS` with the actual IP address of the machine running Docker. If you built the image locally with a different tag, use that tag instead of `ghcr.io/rrauch/autonomi_testnet:latest`.
+Just replace `YOUR_HOST_IP_ADDRESS` with the actual IP address of the machine running Docker that your clients can reach. If you built the image locally with a different tag, use that tag instead of `ghcr.io/rrauch/autonomi_testnet:latest`.
 
 ### Output
 
@@ -62,35 +67,27 @@ Upon successful startup, the container will output details about the running EVM
 
 ```
 ------------------------------------------------------
-evm testnet details
-
-> RPC_URL: http://YOUR_HOST_IP_ADDRESS:14143/
-> PAYMENT_TOKEN_ADDRESS: 0x...
-> DATA_PAYMENTS_ADDRESS: 0x...
-> SECRET_KEY: 0x...
-
+EVM Testnet Details:
+  RPC_URL: http://YOUR_EXTERNAL_IP_ADDRESS:14143/
+  PAYMENT_TOKEN_ADDRESS: 0x...
+  DATA_PAYMENTS_ADDRESS: 0x...
+  SECRET_KEY: 0x...
 ------------------------------------------------------
-node details
-
-53851   12D3KooW...
-53852   12D3KooW...
+Node Details:
+  /ip4/YOUR_EXTERNAL_IP_ADDRESS/udp/53851/quic-v1/p2p/12D3KooW...
+  /ip4/YOUR_EXTERNAL_IP_ADDRESS/udp/53852/quic-v1/p2p/12D3KooW...
 ...
-53875   12D3KooW...
-
+  /ip4/YOUR_EXTERNAL_IP_ADDRESS/udp/53875/quic-v1/p2p/12D3KooWM...
 ------------------------------------------------------
-
-Bootstrap URL: http://YOUR_HOST_IP_ADDRESS:38112/bootstrap.txt
-
+Bootstrap URL: http://YOUR_EXTERNAL_IP_ADDRESS:38112/bootstrap.txt
 ------------------------------------------------------
-
+Autonomi Config URI:
 autonomi:config:local?rpc_url=http%3A%2F%2FYOUR_HOST_IP_ADDRESS%3A14143%2F&payment_token_addr=0x...&data_payments_addr=0x...&bootstrap_url=http%3A%2F%2F2FYOUR_HOST_IP_ADDRESS%3A38112%2Fbootstrap.txt
-
 ------------------------------------------------------
-
 ```
 
 *   **EVM Details:** This section provides connection details for the local EVM used for payment processing. Note that `RPC_URL` will use the `ANVIL_IP_ADDR` you provided.
-*   **Node Details:** This list shows the `node_port` and `peer_id` for each of the 25 running storage nodes. This information is critical for connecting clients.
+*   **Node Details:** This list shows the `node_port` and `peer_id` for each of the running storage nodes. This information is critical for connecting clients.
 
 ## Connecting Your Client
 
@@ -111,14 +108,7 @@ Set the following environment variables in the environment where your Autonomi c
 
 Replace `YOUR_HOST_IP_ADDRESS` with the IP address of the machine running the Docker container, and `[node_port]` and `[peer_id]` with values from the container's output.
 
-**Example `ANT_PEERS` value:**
-
-If the container output shows `53851 12D3KooW...` and your host IP is `192.168.1.100`, set:
-```bash
-export ANT_PEERS="/ip4/192.168.1.100/udp/53851/quic-v1/p2p/12D3KooW..."
-```
-
-**Important Note on `ANT_PEERS`:** The `peer_id` values are **dynamic** and will change every time the container is restarted because the testnet state is not persisted. You **must** update your `ANT_PEERS` environment variable with a fresh peer address from the container's output after each restart.
+**Important Note on `ANT_PEERS`:** The `peer_id` values are **dynamic** and will change every time the container is restarted because the testnet state is not persisted. You **must** update your `ANT_PEERS` environment variable with a fresh peer address from the container's output after each restart. The better option therefore is to use the `Bootstrap URL` - which does NOT change - as a source to configure your clients.
 
 ## Development Notes
 
