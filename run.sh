@@ -26,14 +26,14 @@ if [ -z "$REWARDS_ADDRESS" ]; then
 fi
 echo "REWARDS_ADDRESS is set: $REWARDS_ADDRESS"
 
-echo "Checking for HOST_IP_ADDRESS..."
-if [ -z "$HOST_IP_ADDRESS" ]; then
-  echo "Error: HOST_IP_ADDRESS environment variable is not set. Cannot proceed."
+echo "Checking for EXTERNAL_IP_ADDRESS..."
+if [ -z "$EXTERNAL_IP_ADDRESS" ]; then
+  echo "Error: EXTERNAL_IP_ADDRESS environment variable is not set. Cannot proceed."
   exit 1 # Exit with a non-zero status to indicate failure
 fi
-echo "HOST_IP_ADDRESS is set: $HOST_IP_ADDRESS"
+echo "EXTERNAL_IP_ADDRESS is set: $EXTERNAL_IP_ADDRESS"
 
-export ANVIL_IP_ADDR="$HOST_IP_ADDRESS"
+export ANVIL_IP_ADDR="$EXTERNAL_IP_ADDRESS"
 
 cleanup() {
     exit 0
@@ -46,10 +46,18 @@ CSV_FILE="$DATA_DIR/evm_testnet_data.csv"
 rm -f "$CSV_FILE"
 rm -rf "$DATA_DIR/bootstrap_cache"
 
+BOOTSTRAP_CACHE="$DATA_DIR/bootstrap_cache/bootstrap_cache_local_1_1.0.json"
+
 EXPORT_DIR="$DATA_DIR/export"
 rm -rf "$EXPORT_DIR"
 mkdir -p "$EXPORT_DIR"
 BOOTSTRAP_TXT="$EXPORT_DIR/bootstrap.txt"
+
+REGISTRY_FILE="$DATA_DIR/local_node_registry.json"
+rm -f "$REGISTRY_FILE"
+
+NODE_DIR="$DATA_DIR/node"
+rm -rf "$NODE_DIR"
 
 # 2. Start 'evm-testnet' process in the background
 echo "Starting evm-testnet in the background..."
@@ -125,17 +133,77 @@ parse_csv_file() {
 
 parse_csv_file "$CSV_FILE"
 
-escape_sed_chars() {
-  echo "$1" | sed 's/[.[\*^$|]/\\&/g'
-}
-ESCAPED_RPC_URL=$(escape_sed_chars "$RPC_URL")
 
-LOCAL_RPC_URL="http://localhost:$ANVIL_PORT/"
-#sed -i "s|$ESCAPED_RPC_URL|$LOCAL_RPC_URL|g" "$CSV_FILE"
+echo ">>> Starting nodes for ports [$NODE_PORT] ..."
 
-echo ">>> Executing antctl local run..."
-antctl local run --clean --rewards-address "$REWARDS_ADDRESS" --node-port "$NODE_PORT" --rpc-port "$RPC_PORT"
+start_port=${NODE_PORT%-*}
+end_port=${NODE_PORT#*-}
+
+nodes_started=0
+
+for (( port = start_port; port <= end_port; port++ )); do
+  ((nodes_started++))
+
+  echo "--- Starting Node ${nodes_started} on Port ${port} ---"
+
+  cmd_args=(
+    "antnode"
+    "--rewards-address" "$REWARDS_ADDRESS"
+    "--ip" "$EXTERNAL_IP_ADDRESS"
+    "--local"
+    "--port" "$port"
+  )
+
+  sleep_duration="0.200"
+
+  if (( nodes_started == 1 )); then
+    cmd_args+=("--first")
+    sleep_duration="1"
+  fi
+
+  cmd_args+=(
+    "evm-custom"
+    "--rpc-url" "$RPC_URL"
+    "--payment-token-address" "$PAYMENT_TOKEN_ADDRESS"
+    "--data-payments-address" "$DATA_PAYMENTS_ADDRESS"
+  )
+
+  "${cmd_args[@]}" &
+
+  sleep "$sleep_duration"
+done
+
 sleep 1
+
+if [[ ! -f "$BOOTSTRAP_CACHE" ]]; then
+  echo "Error: Bootstrap cache file not found: $BOOTSTRAP_CACHE" >&2
+  exit 1
+fi
+
+nodes_running=0
+start_time=$SECONDS
+declare -a NODES
+
+while true; do 
+  NODES=()
+  mapfile -t NODES < <(jq -r '.peers[][].addr' "$BOOTSTRAP_CACHE")
+  nodes_running=${#NODES[@]}
+  current_time=$SECONDS
+  elapsed_time=$((current_time - start_time))
+  
+  if (( nodes_running >= nodes_started )); then
+    break
+  fi
+  
+  if (( elapsed_time >= timeout_duration )); then
+    echo "Error: Node startup timeout exceeded, aborting" >&2
+    exit 1
+  fi
+  
+  sleep "0.200"
+done
+
+printf "%s\n" "${NODES[@]}" > "$BOOTSTRAP_TXT"
 
 echo ""	
 echo "------------------------------------------------------"
@@ -151,26 +219,16 @@ echo ""
 echo "node details"
 echo ""
 
-NODES=$(jq '.nodes' "$DATA_DIR/local_node_registry.json")
-echo "$NODES" | jq -c '.[]' | while read -r node; do
-    # Extract peer_id and node_port for the current node
-    peer_id=$(echo "$node" | jq -r '.peer_id')
-    node_port=$(echo "$node" | jq -r '.node_port')
-
-    echo "$node_port   $peer_id"
-done
+printf "%s\n" "${NODES[@]}"
 
 echo ""
 echo "------------------------------------------------------"
 echo ""
 
-jq --arg host_ip "$HOST_IP_ADDRESS" -r \
-   '.nodes[].listen_addr[] | select((split("/") | .[2]) == $host_ip)' \
-   "$DATA_DIR/local_node_registry.json" >> "$BOOTSTRAP_TXT"
 
 darkhttpd "$EXPORT_DIR" --port "$BOOTSTRAP_PORT" --daemon --no-listing > /dev/null 2>&1
 
-BOOTSTRAP_URL="http://$HOST_IP_ADDRESS:$BOOTSTRAP_PORT/bootstrap.txt"
+BOOTSTRAP_URL="http://$EXTERNAL_IP_ADDRESS:$BOOTSTRAP_PORT/bootstrap.txt"
 echo "Bootstrap URL: $BOOTSTRAP_URL"
 
 echo ""
@@ -222,25 +280,19 @@ echo ""
 
 
 # 5. Run 'status_check' command in a loop until it fails
-STATUS_CHECK_SLEEP_SECONDS=2 # How long to sleep between status_check executions
-STATUS_COMMAND="antctl local status --fail" # The command to run repeatedly
+STATUS_CHECK_SLEEP_SECONDS=5 # How long to sleep between status_check executions
 
-echo ">>> Nodes started, observing status: $STATUS_COMMAND"
+echo ">>> Nodes started, observing antnode processes"
 
 while true; do
   # Sleep first
   sleep "$STATUS_CHECK_SLEEP_SECONDS"
-
-  # Execute the command, suppress all output (&>/dev/null)
-  # If the command fails (exit status != 0), the 'if' condition is false
-  if $STATUS_COMMAND &>/dev/null; then
-    # Command succeeded (exit status 0) - do nothing, loop continues
-    : # This is the null command, does nothing
-  else
-    # Command failed (non-zero exit status)
-    EXIT_STATUS=$? # Capture the exit status
-    echo ">>> Command '$STATUS_COMMAND' failed with exit status $EXIT_STATUS. Exiting." >&2 # Output failure to stderr
-    exit $EXIT_STATUS # Exit the script with the command's failure status
+  process_count=$(pgrep -cx antnode || true)
+  if (( process_count != nodes_running )); then
+  echo "Error: Process count mismatch!" >&2  
+  echo "  Expected $nodes_running 'antnode' processes, but found $process_count running." >&2
+  echo "  Node crash assumed, aborting" >&2
+  exit 1 
   fi
 done
 

@@ -2,7 +2,7 @@
 # The `builder` stage compiles the binary and gathers all dependencies in the `/export/` directory.
 FROM debian:12 AS builder
 RUN apt-get update && apt-get -y upgrade \
- && apt-get -y install wget curl build-essential gcc make libssl-dev pkg-config git jq
+ && apt-get -y install wget curl build-essential gcc make libssl-dev pkg-config git jq procps
 
 # Install darkhttpd from Git repo
 RUN cd /usr/local/src/ \
@@ -53,7 +53,7 @@ RUN chmod 0755 /run.sh
 # Use `depres` to identify all required files for the final image.
 RUN depres /bin/sh /bin/bash /bin/ls /usr/bin/su /usr/bin/chown \
     /usr/bin/cat /usr/bin/whoami /usr/bin/id /usr/bin/sleep /usr/bin/head \
-    /usr/bin/sed /usr/bin/rm /usr/bin/jq /usr/bin/mkdir \
+    /usr/bin/sed /usr/bin/rm /usr/bin/jq /usr/bin/mkdir /usr/bin/pgrep \
     /usr/local/sbin/gosu \
     /usr/local/bin/darkhttpd \
     /usr/local/bin/anvil \
@@ -88,9 +88,6 @@ COPY --from=builder /export/ /
 VOLUME /data
 ENV NODE_PORT=53851-53875
 EXPOSE 53851-53875/udp
-
-ENV RPC_PORT=13112-13136
-EXPOSE 13112-13136
 
 ENV ANVIL_PORT=14143
 EXPOSE 14143
