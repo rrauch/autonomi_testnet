@@ -50,15 +50,18 @@ RUN wget -O /usr/local/sbin/gosu https://github.com/tianon/gosu/releases/downloa
 COPY run.sh /
 RUN chmod 0755 /run.sh
 
+COPY init.sh /
+RUN chmod 0755 /init.sh
+
 # Use `depres` to identify all required files for the final image.
-RUN depres /bin/sh /bin/bash /bin/ls /usr/bin/su /usr/bin/chown \
-    /usr/bin/cat /usr/bin/whoami /usr/bin/id /usr/bin/sleep /usr/bin/head \
-    /usr/bin/sed /usr/bin/rm /usr/bin/jq /usr/bin/mkdir /usr/bin/pgrep \
+RUN depres /bin/sh /bin/bash /bin/ls /usr/bin/su /usr/bin/chown /usr/bin/mv \
+    /usr/bin/cat /usr/bin/whoami /usr/bin/id /usr/bin/sleep /usr/bin/head /usr/bin/chmod \
+    /usr/bin/sed /usr/bin/rm /usr/bin/jq /usr/bin/mkdir /usr/bin/pgrep /usr/bin/hostname \
     /usr/local/sbin/gosu \
     /usr/local/bin/darkhttpd \
     /usr/local/bin/anvil \
     /usr/local/bin/antnode /usr/local/bin/evm-testnet /usr/local/bin/antctl \
-    /run.sh \
+    /run.sh /init.sh \
     /etc/ssl/certs/ \
     /usr/share/ca-certificates/ \
     >> /tmp/export.list
@@ -97,4 +100,6 @@ EXPOSE 38112
 
 ENV REWARDS_ADDRESS=0x728Ce96E4833481eE2d66D5f47B50759EF608c5E
 
-CMD /run.sh
+ENV ANTNODE_VERSION=latest
+
+CMD /init.sh

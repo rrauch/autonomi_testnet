@@ -1,21 +1,4 @@
 #!/bin/bash
-
-# Exit immediately if a command exits with a non-zero status.
-set -e
-
-# This part is supposed to run as root
-chown -R autonomi:autonomi /data
-echo "/data ownership updated to autonomi:autonomi."
-
-echo "Switching to user autonomi and executing the rest of the script..."
-
-# Use exec gosu to switch user, and run bash -c with a simple command
-# The command it runs will be 'bash -s', which tells the *inner* bash
-# to read its script from standard input.
-# The following <<'EOF_INNER' then provides that script content.
-exec gosu autonomi /bin/bash -s <<'EOF_INNER'
-# --- Start of commands running as user autonomi (read from stdin) ---
-
 echo "Now running as user $(whoami) (UID $(id -u): GID $(id -g))"
 
 # 1. Check if required environment variables is set
@@ -32,6 +15,28 @@ if [ -z "$EXTERNAL_IP_ADDRESS" ]; then
   exit 1 # Exit with a non-zero status to indicate failure
 fi
 echo "EXTERNAL_IP_ADDRESS is set: $EXTERNAL_IP_ADDRESS"
+
+echo "Checking if IP address '$EXTERNAL_IP_ADDRESS' is configured on this system..."
+
+found=false
+for ip_address in $(hostname -I); do
+  if [[ "$ip_address" == "$EXTERNAL_IP_ADDRESS" ]]; then
+    found=true
+    break # Found it, no need to check further
+  fi
+done
+
+if [[ "$found" == true ]]; then
+  echo "✅ Found: IP address '$EXTERNAL_IP_ADDRESS' is active on this system."
+  echo ""
+else
+  echo "❌ Not Found: IP address '$EXTERNAL_IP_ADDRESS' is not active on this system."
+  echo "   Active IPs reported by hostname -I:"
+  echo "   $(hostname -I)"
+  echo ""
+  echo "Cannot continue, aborting"
+  exit 1
+fi
 
 export ANVIL_IP_ADDR="$EXTERNAL_IP_ADDRESS"
 
@@ -298,7 +303,5 @@ done
 
 # This part is only reached if the 'while true' loop is somehow broken without the command failing.
 echo ">>> Loop unexpectedly terminated." # Should not be reached
-exit 1 # Indicate an unexpected exit
-# --- End of commands running as user autonomi ---
-EOF_INNER
+exit 1
 
