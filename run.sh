@@ -43,6 +43,7 @@ readonly NODE_DIR="$DATA_DIR/node" # Directory for individual node data (if antn
 # Timeouts and Intervals (seconds)
 readonly FILE_WAIT_TIMEOUT_SEC=30
 readonly FILE_WAIT_INTERVAL_SEC=0.2 # Use floating point for sleep
+readonly FIRST_NODE_TIMEOUT_SEC=30  # Timeout waiting for the *first* node to be ready
 readonly NODE_WAIT_TIMEOUT_SEC=60   # Timeout for nodes appearing in bootstrap cache
 readonly NODE_WAIT_INTERVAL_SEC=0.2
 readonly MONITOR_INTERVAL_SEC=5
@@ -261,13 +262,9 @@ start_nodes() {
             "--local"
             "--port" "$port"
         )
-
-        local sleep_duration="0.2" # Default short delay between starts
-
         # Special handling for the first node
         if (( NODES_STARTED == 1 )); then
             cmd_args+=("--first")
-            sleep_duration="1.0" # Longer delay after starting the first node
         fi
 
         # Add EVM custom parameters
@@ -283,9 +280,16 @@ start_nodes() {
         "${cmd_args[@]}" &
         ANTNODE_PIDS+=($!) # Store the PID
         log "Node ${NODES_STARTED} started with PID ${ANTNODE_PIDS[-1]} on port ${port}."
+        
+        # If this is the first node, wait for it to create the bootstrap cache
+        if (( NODES_STARTED == 1 )); then
+            log "Waiting up to ${FIRST_NODE_TIMEOUT_SEC}s for the first node (PID ${ANTNODE_PIDS[-1]}) to create '$BOOTSTRAP_CACHE'..."
+            # Reuse wait_for_file, using the specific timeout for this step
+            wait_for_file "$BOOTSTRAP_CACHE" "$FIRST_NODE_TIMEOUT_SEC" "$FILE_WAIT_INTERVAL_SEC"
+            log "Bootstrap cache file found. Proceeding..."
+        fi
 
-        log "Sleeping for ${sleep_duration}s..."
-        sleep "$sleep_duration"
+        sleep "0.2"
     done
 
     if [[ ${#ANTNODE_PIDS[@]} -ne $NODES_STARTED ]]; then
@@ -295,19 +299,12 @@ start_nodes() {
     log "All $NODES_STARTED antnode processes initiated."
 }
 
-# Wait for nodes to appear in the bootstrap cache file
+# Wait for nodes to appear in the bootstrap cache file and ensure processes are alive
 wait_for_nodes() {
     log "Waiting up to ${NODE_WAIT_TIMEOUT_SEC}s for $NODES_STARTED nodes to register in '$BOOTSTRAP_CACHE'..."
 
     if [[ ! -f "$BOOTSTRAP_CACHE" ]]; then
-      # It might take a moment for the *first* node to create the cache
-      log "Bootstrap cache '$BOOTSTRAP_CACHE' not present yet, waiting..."
-      # Add a brief initial wait specific for the cache file itself if needed
-      sleep 2
-      if [[ ! -f "$BOOTSTRAP_CACHE" ]]; then
-          err "Bootstrap cache file '$BOOTSTRAP_CACHE' did not appear."
-          exit 1
-      fi
+      err "Bootstrap cache '$BOOTSTRAP_CACHE' not present yet, aborting..."
     fi
 
     local start_time nodes_running elapsed
@@ -315,6 +312,20 @@ wait_for_nodes() {
     declare -a discovered_nodes=()
 
     while true; do
+        # --- PROCESS LIVENESS CHECK ---
+        # Check if all expected antnode processes are still running before checking the cache
+        local running_pid_count=0
+        for pid in "${ANTNODE_PIDS[@]}"; do
+            if kill -0 "$pid" &>/dev/null; then
+                ((++running_pid_count))
+            else
+                # Found a dead process! Exit immediately.
+                err "Detected antnode process with expected PID $pid is no longer running *during startup registration phase*."
+                err "Node likely crashed before registering. Aborting."
+                exit 1
+            fi
+        done
+    
         # Use || true with jq in case the file is empty or malformed temporarily
         mapfile -t discovered_nodes < <(jq -r '.peers[][].addr' "$BOOTSTRAP_CACHE" || true)
         nodes_running=${#discovered_nodes[@]}
